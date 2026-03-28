@@ -1,0 +1,5 @@
+{
+  "name": "T20WC Cricket OS Simulator",
+  "description": "An Operating Systems based T20 Cricket Simulator demonstrating Thread Pools, Mutexes, Semaphores, Condition Variables, and Custom Scheduling (RR, SJF, Priority).",
+  "requestFramePermissions": []
+}
