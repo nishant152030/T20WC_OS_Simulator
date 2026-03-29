@@ -61,7 +61,7 @@ Cricket OS is an interactive educational tool that visualizes core Operating Sys
 
 The simulation tracks:
 - **Wait Time**: How long a batsman waited in the dugout before getting to the crease.
-- **Stay Duration**: The actual logical time the batsman spent on the pitch.
+- **Stay Duration**: The logical time used to calculate the probablity of wicket when the batsman is on the pitch.
 - **Throughput**: Runs scored per unit of logical time.
 
 ## 📜 License
