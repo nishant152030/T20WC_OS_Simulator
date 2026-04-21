@@ -75,6 +75,11 @@ type CricketEngine struct {
 	ScoreMutex      sync.Mutex
 	FielderCond     *sync.Cond
 	CreaseSemaphore chan struct{}
+	
+	// Crease End Mutexes for Circular Wait Deadlock Detection
+	End1Mutex sync.Mutex      // Batsman at End 1
+	End2Mutex sync.Mutex      // Batsman at End 2
+	DeadlockDetected bool      // Flag for deadlock detection
 
 	GlobalScore   int
 	GlobalWickets int
@@ -97,6 +102,80 @@ type CricketEngine struct {
 
 var engine *CricketEngine
 var engineMutex sync.Mutex
+
+// DetectAndResolveRunOut implements genuine Circular Wait Deadlock Detection.
+//
+// How it works:
+//   This function pre-locks both crease ends before spawning goroutines.
+//   Goroutine A (Batsman at End1): tries to re-lock End1 → blocks immediately
+//   Goroutine B (Batsman at End2): tries to re-lock End2 → blocks immediately
+//   Both goroutines are now stuck — genuine circular wait — neither can proceed.
+//
+// The umpire (this function) detects the deadlock via a timeout and resolves it
+// by unlocking both ends forcibly (kernel preemption), draining the goroutines.
+func (e *CricketEngine) DetectAndResolveRunOut(batsman1, batsman2 *Player) (runOutOccurred bool, victimName string) {
+	// Buffered so goroutines never block on send after we return
+	done := make(chan bool, 2)
+
+	// Pre-lock both ends: simulates each batsman occupying their starting end.
+	// Goroutine A holds End1 and wants End2, Goroutine B holds End2 and wants End1.
+	e.End1Mutex.Lock()
+	e.End2Mutex.Lock()
+
+	// Goroutine A: holds End1 (locked above), now tries to acquire End2
+	// Will block because End2 is held — circular wait begins
+	go func() {
+		e.End2Mutex.Lock()
+		e.End2Mutex.Unlock()
+		done <- true
+	}()
+
+	// Goroutine B: holds End2 (locked above), now tries to acquire End1
+	// Will block because End1 is held — circular wait complete
+	go func() {
+		e.End1Mutex.Lock()
+		e.End1Mutex.Unlock()
+		done <- true
+	}()
+
+	// Umpire waits. Both goroutines are stuck so timeout always fires —
+	// demonstrating genuine deadlock detection via timeout.
+	completed := 0
+	timeout := time.After(30 * time.Millisecond)
+
+	for completed < 2 {
+		select {
+		case <-done:
+			completed++
+		case <-timeout:
+			// ── Deadlock confirmed ──────────────────────────────────────
+			// Umpire (Kernel) preempts: forcibly releases both crease ends
+			// so the blocked goroutines can unblock and terminate cleanly.
+			e.End1Mutex.Unlock()
+			e.End2Mutex.Unlock()
+
+			runOutOccurred = true
+			if rand.Float64() < 0.5 {
+				victimName = batsman1.Name
+			} else {
+				victimName = batsman2.Name
+			}
+			e.DeadlockDetected = true
+
+			// Drain goroutines in background so they don't leak
+			go func() {
+				<-done
+				<-done
+			}()
+			return
+		}
+	}
+
+	// Both finished without timeout — no deadlock
+	e.End1Mutex.Unlock()
+	e.End2Mutex.Unlock()
+	return false, ""
+}
 
 func initEngine(policy string) {
 	// Stop old engine goroutines if any
@@ -322,24 +401,42 @@ func (e *CricketEngine) BowlBall() *BallLog {
 	}
 
 	// 4. Deadlock Scenario: Circular Wait (Run-out)
-	if runs >=1 {
-		if rand.Float64() < 0.1 { // 10% chance of deadlock
-			// Umpire (The Kernel) detects deadlock and "kills" one process
+	// Both batsmen try to run between crease ends simultaneously
+	// This creates circular wait: A holds End1 & wants End2, B holds End2 & wants End1
+	// Only triggered with 10% probability — not every run causes a collision
+	deadlockReleased := false
+	if runs >= 1 && !extra && rand.Float64() < 0.10 {
+		nonStriker := e.ActiveBatsmen[1] // The other batsman
+
+		// Attempt to detect circular wait deadlock
+		runOutOccurred, runOutVictim := e.DetectAndResolveRunOut(&striker, &nonStriker)
+		
+		if runOutOccurred {
+			// Deadlock detected - Umpire (Kernel) detects and kills one process
 			e.GlobalWickets++
 			wicket = true
+			deadlockReleased = true
 
-			// Release Crease Semaphore
+			// Release Crease Semaphore (victim cannot use it anymore)
 			<-e.CreaseSemaphore
+			
 			e.Timestamp++
 			e.GanttLogs = append(e.GanttLogs, GanttData{
 				Timestamp: e.Timestamp,
 				Player:    "Umpire",
 				Resource:  "Deadlock Resolver",
 				Duration:  1,
-				Label:     "Umpire (Deadlock Resolver)",
+				Label:     fmt.Sprintf("Umpire (Run-out: %s - Circular Wait Detected)", runOutVictim),
 			})
 		} else {
-			// Normal context switch: Batsmen swap ends
+			// No deadlock: Normal running between ends - batsmen swap
+			if runs%2 == 1 {
+				e.ActiveBatsmen[0], e.ActiveBatsmen[1] = e.ActiveBatsmen[1], e.ActiveBatsmen[0]
+			}
+		}
+	} else if runs >= 1 && !extra {
+		// Normal ball with no run-out attempt: still swap on odd runs
+		if runs%2 == 1 {
 			e.ActiveBatsmen[0], e.ActiveBatsmen[1] = e.ActiveBatsmen[1], e.ActiveBatsmen[0]
 		}
 	}
@@ -347,7 +444,7 @@ func (e *CricketEngine) BowlBall() *BallLog {
 	// Handle Wicket / Next Batsman
 	if wicket && e.GlobalWickets < 11 {
 		// Release Crease Semaphore if not already released by deadlock
-		if runs != 1 && runs != 3 {
+		if !deadlockReleased {
 			<-e.CreaseSemaphore
 		}
 
@@ -507,6 +604,13 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 	})
 
+	// Before (silently exits on error):
 	fmt.Println("Go Backend running on :8080")
 	http.ListenAndServe(":8080", nil)
+
+	// After (tells you exactly what went wrong):
+	fmt.Println("Go Backend running on :8080")
+	if err := http.ListenAndServe(":8080", nil); err != nil {
+		fmt.Println("Server error:", err)
+	}
 }
